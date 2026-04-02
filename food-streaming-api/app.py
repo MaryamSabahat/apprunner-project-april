@@ -1,59 +1,86 @@
-
-
 from fastapi import FastAPI, Query
-import pandas as pd
-import boto3
-from io import StringIO
-import uvicorn
+from fastapi.responses import JSONResponse
+import duckdb
+import logging
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-def fetch_data(year: int = None, country: str = None, market: str = None):
-    try:
-        # Load CSV content into a pandas DataFrame
-        df = pd.read_csv("https://s3-food-data-test.s3.us-east-1.amazonaws.com/total_data.csv")
+CSV_URL = "https://s3-food-data-test.s3.us-east-1.amazonaws.com/total_data.csv"
 
-        print(df.shape[0])
-        # Apply filters based on provided parameters
-        if year is not None:
-            print("1")
-            df = df[df['year'] == year]
-        if country is not None:
-            print("2")
-            df = df[df['country'] == country]
-        if market is not None:
-            print("3")
-            df = df[df['mkt_name'] == market]
+@app.get('/')
+async def root():
+    return {
+        "message": "Food Data API (Memory Efficient)",
+        "endpoints": {
+            "/fetch_data": "Filter by year, country, market",
+            "/health": "Health check"
+        }
+    }
 
-        # Fill NaN values with empty strings
-        df_filter = df.fillna('')
-
-        print(df_filter.shape[0])
-        
-        # Convert filtered DataFrame to JSON
-        if df_filter is None or df_filter.empty:
-            raise ValueError('No data found for the specified filters.')
-        else:
-            filtered_json = df_filter.to_json(orient='records')
-            return filtered_json
-
-    except Exception as e:
-        return {'error': str(e)}
+@app.get('/health')
+async def health():
+    return {"status": "healthy"}
 
 @app.get('/fetch_data')
-async def fetch_data_api(year: int = Query(None), country: str = Query(None), market: str = Query(None)):
+async def fetch_data(
+    year: int = Query(None, description="Filter by year"),
+    country: str = Query(None, description="Filter by country name"),
+    market: str = Query(None, description="Filter by market name"),
+    limit: int = Query(100, ge=1, le=5000, description="Max records to return")
+):
+    """
+    Query CSV directly without loading into memory.
+    DuckDB streams the file and only processes what's needed.
+    """
     try:
-        # Call fetch_data function with provided parameters
-        filtered_data = fetch_data(year, country, market)
-
-        if filtered_data is None:
-            raise ValueError('No data found for the specified filters.')
-        else:
-            # Return filtered data as API response
-            return filtered_data
+        # Create in-memory database (very lightweight)
+        conn = duckdb.connect(':memory:')
+        
+        # Build query - DuckDB reads CSV on the fly
+        query = f"SELECT * FROM read_csv_auto('{CSV_URL}') WHERE 1=1"
+        
+        if year:
+            query += f" AND year = {year}"
+        
+        if country:
+            query += f" AND country ILIKE '%{country}%'"
+        
+        if market:
+            query += f" AND mkt_name ILIKE '%{market}%'"
+        
+        query += f" LIMIT {limit}"
+        
+        logger.info(f"Executing query: {query}")
+        
+        # Execute and get results as pandas DataFrame (only results, not full file)
+        result_df = conn.execute(query).df()
+        conn.close()
+        
+        if result_df.empty:
+            return JSONResponse(
+                content={"error": "No data found for filters", "records": 0},
+                status_code=404
+            )
+        
+        # Convert to records (only the filtered results)
+        records = result_df.fillna('').to_dict(orient='records')
+        
+        return {
+            "total": len(records),
+            "filters": {"year": year, "country": country, "market": market},
+            "data": records
+        }
+        
     except Exception as e:
-        return {'error': str(e)}, 400
+        logger.error(f"Query failed: {str(e)}")
+        return JSONResponse(
+            content={"error": f"Query failed: {str(e)}"},
+            status_code=500
+        )
 
 if __name__ == '__main__':
-    uvicorn.run(app, port=8080, host='0.0.0.0')
+    import uvicorn
+    uvicorn.run(app, host='0.0.0.0', port=8080)
