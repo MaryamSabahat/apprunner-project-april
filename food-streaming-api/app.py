@@ -1,114 +1,59 @@
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
-import pandas as pd
-import logging
-import traceback
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+
+from fastapi import FastAPI, Query
+import pandas as pd
+import boto3
+from io import StringIO
+import uvicorn
+
 
 app = FastAPI()
 
-CSV_URL = "https://s3-food-data-test.s3.us-east-1.amazonaws.com/total_data.csv"
-
-@app.get('/')
-async def root():
-    return {
-        "message": "API running in streaming mode - memory safe",
-        "endpoints": {
-            "/fetch_data": "Filter data (streams CSV in chunks)",
-            "/debug/health": "Health check",
-            "/debug/countries": "List available countries"
-        }
-    }
-
-@app.get('/debug/health')
-async def health():
-    return {"status": "healthy", "mode": "streaming"}
-
-@app.get('/debug/countries')
-async def list_countries():
-    """Get unique countries without loading full CSV"""
+def fetch_data(year: int = None, country: str = None, market: str = None):
     try:
-        # Read only the country column in chunks
-        countries = set()
-        for chunk in pd.read_csv(CSV_URL, chunksize=10000, usecols=['country']):
-            countries.update(chunk['country'].dropna().unique())
+        # Load CSV content into a pandas DataFrame
+        df = pd.read_csv("https://s3-food-data-test.s3.us-east-1.amazonaws.com/total_data.csv")
+
+        print(df.shape[0])
+        # Apply filters based on provided parameters
+        if year is not None:
+            print("1")
+            df = df[df['year'] == year]
+        if country is not None:
+            print("2")
+            df = df[df['country'] == country]
+        if market is not None:
+            print("3")
+            df = df[df['mkt_name'] == market]
+
+        # Fill NaN values with empty strings
+        df_filter = df.fillna('')
+
+        print(df_filter.shape[0])
         
-        return {"countries": sorted(list(countries))[:50]}  # First 50
+        # Convert filtered DataFrame to JSON
+        if df_filter is None or df_filter.empty:
+            raise ValueError('No data found for the specified filters.')
+        else:
+            filtered_json = df_filter.to_json(orient='records')
+            return filtered_json
+
     except Exception as e:
-        return {"error": str(e)}
+        return {'error': str(e)}
 
 @app.get('/fetch_data')
-async def fetch_data_api(
-    year: int = Query(None),
-    country: str = Query(None),
-    market: str = Query(None),
-    limit: int = Query(100, le=5000)
-):
-    """
-    Stream CSV in chunks, filter, return results.
-    Memory usage stays under 500MB regardless of CSV size.
-    """
+async def fetch_data_api(year: int = Query(None), country: str = Query(None), market: str = Query(None)):
     try:
-        logger.info(f"Request: year={year}, country={country}, market={market}")
-        
-        chunk_size = 10000
-        matching_rows = []
-        total_matched = 0
-        
-        # Define columns we need (optional - remove to get all)
-        # usecols = ['country', 'mkt_name', 'year', 'month']  # Uncomment to load only specific columns
-        
-        for chunk_idx, chunk in enumerate(pd.read_csv(CSV_URL, chunksize=chunk_size, low_memory=False)):
-            # Apply filters
-            if year is not None and 'year' in chunk.columns:
-                chunk = chunk[chunk['year'] == year]
-            
-            if country is not None and 'country' in chunk.columns:
-                chunk = chunk[chunk['country'].astype(str).str.contains(country, case=False, na=False)]
-            
-            if market is not None and 'mkt_name' in chunk.columns:
-                chunk = chunk[chunk['mkt_name'].astype(str).str.contains(market, case=False, na=False)]
-            
-            if not chunk.empty:
-                matching_rows.append(chunk)
-                total_matched += len(chunk)
-                logger.info(f"Chunk {chunk_idx}: found {len(chunk)} matches (total: {total_matched})")
-                
-                # Stop once we have enough results
-                if total_matched >= limit:
-                    break
-        
-        if not matching_rows:
-            return JSONResponse(
-                content={"error": "No data found", "records": 0},
-                status_code=404
-            )
-        
-        # Combine only the matching rows (small result set)
-        result_df = pd.concat(matching_rows, ignore_index=True)
-        
-        # Limit to requested number
-        if len(result_df) > limit:
-            result_df = result_df.head(limit)
-        
-        logger.info(f"Returning {len(result_df)} records")
-        
-        return JSONResponse(content={
-            "total": len(result_df),
-            "filters": {"year": year, "country": country, "market": market},
-            "data": result_df.fillna('').to_dict(orient='records')
-        })
-        
+        # Call fetch_data function with provided parameters
+        filtered_data = fetch_data(year, country, market)
+
+        if filtered_data is None:
+            raise ValueError('No data found for the specified filters.')
+        else:
+            # Return filtered data as API response
+            return filtered_data
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        logger.error(traceback.format_exc())
-        return JSONResponse(
-            content={"error": str(e), "trace": traceback.format_exc()},
-            status_code=500
-        )
+        return {'error': str(e)}, 400
 
 if __name__ == '__main__':
-    import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8080)
+    uvicorn.run(app, port=8080, host='0.0.0.0')
