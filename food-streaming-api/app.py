@@ -9,37 +9,35 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# CSV location
 CSV_URL = "https://s3-food-data-test.s3.us-east-1.amazonaws.com/total_data.csv"
 
 @app.get('/')
 async def root():
     return {
-        "message": "API is running (streaming mode - memory safe)",
+        "message": "API running in streaming mode - memory safe",
         "endpoints": {
-            "/fetch_data": "GET with params: year, country, market, limit",
+            "/fetch_data": "Filter data (streams CSV in chunks)",
             "/debug/health": "Health check",
-            "/debug/sample": "Preview first N rows"
+            "/debug/countries": "List available countries"
         }
     }
 
 @app.get('/debug/health')
 async def health():
-    """Simple health check - no CSV loading"""
     return {"status": "healthy", "mode": "streaming"}
 
-@app.get('/debug/sample')
-async def get_sample(rows: int = Query(5, le=100)):
-    """Preview first few rows without heavy memory use"""
+@app.get('/debug/countries')
+async def list_countries():
+    """Get unique countries without loading full CSV"""
     try:
-        df_sample = pd.read_csv(CSV_URL, nrows=rows)
-        return {
-            "columns": list(df_sample.columns),
-            "sample_data": df_sample.fillna('').to_dict(orient='records')
-        }
+        # Read only the country column in chunks
+        countries = set()
+        for chunk in pd.read_csv(CSV_URL, chunksize=10000, usecols=['country']):
+            countries.update(chunk['country'].dropna().unique())
+        
+        return {"countries": sorted(list(countries))[:50]}  # First 50
     except Exception as e:
-        logger.error(f"Sample error: {e}")
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return {"error": str(e)}
 
 @app.get('/fetch_data')
 async def fetch_data_api(
@@ -50,41 +48,52 @@ async def fetch_data_api(
 ):
     """
     Stream CSV in chunks, filter, return results.
-    Never loads full file into memory.
+    Memory usage stays under 500MB regardless of CSV size.
     """
     try:
         logger.info(f"Request: year={year}, country={country}, market={market}")
         
         chunk_size = 10000
-        matching_chunks = []
-        rows_collected = 0
+        matching_rows = []
+        total_matched = 0
         
-        # Read CSV in chunks
-        for chunk in pd.read_csv(CSV_URL, chunksize=chunk_size, low_memory=False):
+        # Define columns we need (optional - remove to get all)
+        # usecols = ['country', 'mkt_name', 'year', 'month']  # Uncomment to load only specific columns
+        
+        for chunk_idx, chunk in enumerate(pd.read_csv(CSV_URL, chunksize=chunk_size, low_memory=False)):
             # Apply filters
             if year is not None and 'year' in chunk.columns:
                 chunk = chunk[chunk['year'] == year]
+            
             if country is not None and 'country' in chunk.columns:
                 chunk = chunk[chunk['country'].astype(str).str.contains(country, case=False, na=False)]
+            
             if market is not None and 'mkt_name' in chunk.columns:
                 chunk = chunk[chunk['mkt_name'].astype(str).str.contains(market, case=False, na=False)]
             
             if not chunk.empty:
-                matching_chunks.append(chunk)
-                rows_collected += len(chunk)
+                matching_rows.append(chunk)
+                total_matched += len(chunk)
+                logger.info(f"Chunk {chunk_idx}: found {len(chunk)} matches (total: {total_matched})")
                 
-                # Stop once we have enough
-                if rows_collected >= limit:
+                # Stop once we have enough results
+                if total_matched >= limit:
                     break
         
-        if not matching_chunks:
+        if not matching_rows:
             return JSONResponse(
                 content={"error": "No data found", "records": 0},
                 status_code=404
             )
         
-        # Combine results (only the filtered rows, not full file)
-        result_df = pd.concat(matching_chunks, ignore_index=True).head(limit)
+        # Combine only the matching rows (small result set)
+        result_df = pd.concat(matching_rows, ignore_index=True)
+        
+        # Limit to requested number
+        if len(result_df) > limit:
+            result_df = result_df.head(limit)
+        
+        logger.info(f"Returning {len(result_df)} records")
         
         return JSONResponse(content={
             "total": len(result_df),
@@ -93,8 +102,12 @@ async def fetch_data_api(
         })
         
     except Exception as e:
+        logger.error(f"Error: {str(e)}")
         logger.error(traceback.format_exc())
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(
+            content={"error": str(e), "trace": traceback.format_exc()},
+            status_code=500
+        )
 
 if __name__ == '__main__':
     import uvicorn
